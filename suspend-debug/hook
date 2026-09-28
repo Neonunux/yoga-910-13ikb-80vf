@@ -1,0 +1,189 @@
+#!/bin/bash
+# Installed by suspend-debug.sh into /usr/local/lib/suspend-debug/ and linked
+# from /usr/lib/systemd/system-sleep/: logs the state of the machine before and
+# after every suspend to the journal (tag suspend-debug).
+#
+#   hook pre <type>    called by systemd-sleep before the suspend
+#   hook post <type>   called by systemd-sleep after the resume
+#   hook watch         started by "post": watches the lid for 3 minutes
+#   hook sample        one state line, nothing logged (for lidtest)
+#   hook context       the context line, nothing logged
+#
+# The real lid state is read from the EC (byte 0x40, bit 2 = LSTE, bit 0 = RPWR
+# AC power), because _LID returns LIDS, which _WAK forces to 1 (open) on every
+# resume (80VF DSDT, see README.md).
+#
+# Hang on resume: whatever is not on disk is lost on a forced power off, hence
+# the journalctl --sync calls. If /etc/suspend-debug/pm_trace exists, pm_trace is
+# enabled before every suspend and the hardware clock is set right after it.
+HOOK=/usr/local/lib/suspend-debug/hook
+STATE=/run/suspend-debug
+TRACE_FLAG=/etc/suspend-debug/pm_trace
+EC_IO=/sys/kernel/debug/ec/ec0/io
+BAT=/sys/class/power_supply/BAT1
+AC=/sys/class/power_supply/ADP1
+WATCH_UNIT=suspend-debug-watch
+
+log() { logger -t suspend-debug -- "$*"; }
+
+ec_lid() {
+	local b
+	[ -r "$EC_IO" ] || modprobe ec_sys 2>/dev/null
+	b=$(dd if="$EC_IO" bs=1 skip=$((0x40)) count=1 status=none 2>/dev/null | od -An -tu1 | tr -d ' ')
+	[ -n "$b" ] || { echo "?"; return; }
+	(( b & 4 )) && echo open || echo closed
+}
+
+acpi_lid() { awk '{print $2}' /proc/acpi/button/lid/*/state 2>/dev/null | head -1; }
+
+logind_lid() {
+	busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+		org.freedesktop.login1.Manager LidClosed 2>/dev/null | awk '{print ($2=="true") ? "closed" : "open"}'
+}
+
+# lid state as seen by the EC, by ACPI (_LID) and by logind
+lid_state() {
+	echo "lid_ec=$(ec_lid) lid_acpi=$(acpi_lid) lid_logind=$(logind_lid)"
+}
+
+power_state() {
+	echo "ac=$(cat $AC/online 2>/dev/null) energy_uwh=$(cat $BAT/energy_now 2>/dev/null) capacity=$(cat $BAT/capacity 2>/dev/null) bat=$(cat $BAT/status 2>/dev/null)"
+}
+
+join() { paste -sd, - | sed 's/^$/-/'; }
+
+# the scenario: what was plugged in, loaded, and in which position
+context() {
+	local d h ang sw ev mods
+	d=$(for c in /sys/class/drm/card*-*; do [ "$(cat "$c/status" 2>/dev/null)" = connected ] && echo "${c##*/card?-}"; done | join)
+	h=$(for u in /sys/bus/usb/devices/*; do
+		[ -f "$u/idVendor" ] && [ "$(cat "$u/bDeviceClass")" != 09 ] && echo "$(cat "$u/idVendor"):$(cat "$u/idProduct")"
+	done | join)
+	for i in /sys/bus/iio/devices/iio:device*; do
+		[ "$(cat "$i/name" 2>/dev/null)" = hinge ] || continue
+		ang=$(awk -v r="$(cat "$i/in_angl0_raw")" -v s="$(cat "$i/in_angl_scale")" 'BEGIN{printf "%.0f", r*s*180/3.14159265358979}')
+	done
+	ev=$(grep -A5 'tablet mode switch' /proc/bus/input/devices | grep -o 'event[0-9]*' | head -1)
+	if [ -n "$ev" ] && command -v evtest >/dev/null; then
+		evtest --query "/dev/input/$ev" EV_SW SW_TABLET_MODE && sw=laptop || sw=tablet
+	fi
+	mods=$(grep -oE '^(hid_sensor_custom_intel_hinge|hid_sensor_custom|ec_sys) ' /proc/modules | tr -d ' ' | join)
+	echo "uptime_s=$(cut -d. -f1 /proc/uptime) nth=$(( $(cat /sys/power/suspend_stats/success) + $(cat /sys/power/suspend_stats/fail) + 1 ))" \
+		"displays=$d usb=$h hinge_deg=${ang:-?} tablet_sw=${sw:-?} modules=$mods" \
+		"tudor=$(pgrep -x tudor_host >/dev/null && echo 1 || echo 0) tainted=$(cat /proc/sys/kernel/tainted)" \
+		"pm_trace=$(cat /sys/power/pm_trace) pm_async=$(cat /sys/power/pm_async)"
+}
+
+# "name value" counters, one per line: ACPI GPEs, then wake-up sources
+snapshot_counters() {
+	local f w
+	for f in /sys/firmware/acpi/interrupts/gpe[0-9A-F][0-9A-F] /sys/firmware/acpi/interrupts/sci \
+		/sys/firmware/acpi/interrupts/ff_pwr_btn /sys/firmware/acpi/interrupts/ff_slp_btn; do
+		echo "${f##*/} $(awk '{print $1}' "$f")"
+	done
+	for w in /sys/class/wakeup/wakeup*; do
+		echo "wk:$(cat "$w/name")@${w##*/wakeup} $(cat "$w/wakeup_count")/$(cat "$w/event_count")"
+	done
+	for f in /sys/power/suspend_stats/*; do
+		echo "stat:${f##*/} $(cat "$f")"
+	done
+}
+
+# differences between two snapshots: "gpe50+3 wk:PNP0C0D:00@12+1/2 ..."
+diff_counters() {
+	awk 'NR==FNR { a[$1]=$2; next }
+	     {
+	        if ($1 ~ /^wk:/) {
+	            split(a[$1], o, "/"); split($2, n, "/")
+	            if (n[1] != o[1] || n[2] != o[2]) printf "%s+%d/%d ", $1, n[1]-o[1], n[2]-o[2]
+	        } else if ($1 ~ /^stat:last_failed/) {
+	            if ($2 != a[$1]) printf "%s=%s ", $1, $2
+	        } else if ($2 != a[$1]) printf "%s+%d ", $1, $2-a[$1]
+	     }' "$1" "$2"
+}
+
+case "$1" in
+pre)
+	mkdir -p "$STATE"
+	systemctl stop "$WATCH_UNIT" 2>/dev/null
+	if [ -e "$TRACE_FLAG" ]; then echo 1 >/sys/power/pm_trace; fi
+	date +%s >"$STATE/pre_time"
+	cat $BAT/energy_now >"$STATE/pre_energy" 2>/dev/null
+	cat $AC/online >"$STATE/pre_ac" 2>/dev/null
+	snapshot_counters >"$STATE/pre_counters"
+	log "pre type=$2 $(lid_state) $(power_state) mem_sleep=$(grep -o '\[[a-z0-9]*\]' /sys/power/mem_sleep | tr -d '[]')"
+	log "context $(context)"
+	# if the machine does not come back, these lines must already be on disk
+	journalctl --sync 2>/dev/null
+	;;
+post)
+	mkdir -p "$STATE"
+	now=$(date +%s)
+	# on disk right away: after a forced power off, proves that the kernel
+	# finished the resume and that processes were thawed
+	log "post-alive"
+	journalctl --sync 2>/dev/null
+	snapshot_counters >"$STATE/post_counters"
+	t0=$(cat "$STATE/pre_time" 2>/dev/null || echo "$now")
+	e0=$(cat "$STATE/pre_energy" 2>/dev/null); e1=$(cat $BAT/energy_now 2>/dev/null)
+	ac0=$(cat "$STATE/pre_ac" 2>/dev/null); ac1=$(cat $AC/online 2>/dev/null)
+	dur=$((now - t0))
+	drain=""
+	if [ -n "$e0" ] && [ -n "$e1" ] && [ "$ac0" = 0 ] && [ "$ac1" = 0 ] && [ "$dur" -ge 600 ]; then
+		# µWh used / hours → mW
+		drain="drain_mw=$(( (e0 - e1) * 3600 / dur / 1000 ))"
+	fi
+	irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
+	[ -n "$irq" ] && irq="$irq($(awk -v i="$irq:" '$1==i {print $NF}' /proc/interrupts))"
+	log "post type=$2 duration_s=$dur $drain $(lid_state) $(power_state) wake_irq=${irq:-none}"
+	log "wake counters: $(diff_counters "$STATE/pre_counters" "$STATE/post_counters")"
+	[ "$(ec_lid)" = closed ] && [ "$(acpi_lid)" = open ] && \
+		log "ANOMALY lid closed (EC) but reported open (_LID) right after resume"
+	if [ "$(cat /sys/power/pm_trace)" = 1 ]; then
+		# pm_trace wrote its trace into the RTC; the system time, computed before
+		# the first trace writes of the resume, is still right: copy it back
+		if [ "$dur" -ge 0 ] && [ "$dur" -lt $((60 * 86400)) ]; then
+			hwclock --systohc 2>/dev/null && log "pm_trace: RTC restored from system time"
+		else
+			log "ANOMALY clock after resume looks wrong (duration_s=$dur), RTC left untouched"
+		fi
+	fi
+	journalctl --sync 2>/dev/null
+	systemd-run --quiet --collect --unit="$WATCH_UNIT" "$HOOK" watch 2>/dev/null
+	;;
+watch)
+	# for 3 minutes after the resume: log every change of the lid state, flag a
+	# machine awake with its lid closed that logind believes open, and flush the
+	# journal to disk every 5 s so that a hang does not erase it
+	prev=""; flagged=""
+	start=$(date +%s)
+	for i in $(seq 1 36); do
+		cur=$(lid_state)
+		if [ "$cur" != "$prev" ]; then
+			log "watch t=+$(( $(date +%s) - start ))s $cur"
+			prev=$cur
+		fi
+		if [ -z "$flagged" ] && [[ $cur == *lid_ec=closed* ]] && [[ $cur == *lid_logind=open* ]] && [ "$i" -ge 8 ]; then
+			log "ANOMALY awake with lid closed (EC) while logind believes it open, +$(( $(date +%s) - start ))s after resume"
+			flagged=1
+		fi
+		if [ "$i" = 12 ] && [ -e "$TRACE_FLAG" ]; then
+			log "watch clock $(timedatectl timesync-status --no-pager 2>/dev/null | awk '/Offset:/{print "ntp_offset=" $2}')"
+		fi
+		journalctl --sync 2>/dev/null
+		sleep 5
+	done
+	log "watch end $(lid_state)"
+	;;
+sample)
+	lid_state
+	;;
+context)
+	context
+	;;
+*)
+	echo "usage: $0 pre|post <type> | watch | sample | context" >&2
+	exit 2
+	;;
+esac
+exit 0

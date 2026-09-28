@@ -1,0 +1,153 @@
+From edb81b5d6b7d67ecf95801c91036b76b71ae6beb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Sun, 27 Sep 2026 23:05:18 +0200
+Subject: [PATCH] Add support for Validity 138a:0094 (Lenovo Yoga 910/720,
+ IdeaPad Air 13 Pro)
+
+The 138a:0094 shares the ROM (v6.7 build 164) and the signed blobs of the
+138a:0090, but its factory flash layout differs and, crucially, its partition
+table is written WITHOUT an appended signature.
+
+Captured from the vendor driver on the wire, the 0094 partition_flash (0x4f)
+uses the 0090 layout except for a larger template DB (0xb0000 instead of
+0x30000), and the partition-table TLV carries only the 5 entries (each with
+its own SHA-256) with no trailing RSA signature. Sending the 0090 signature,
+or any signature, is rejected with 0x04af; sending none succeeds.
+
+Changes:
+- usb.py: recognise 138a:0094.
+- init_flash.py: add flash_layout_hardcoded_0094 (DB 0xb0000) and, for 0094,
+  send an empty partition signature.
+- blobs.py / firmware_tables.py: reuse the 0090 signed blobs and xpfwext
+  (the extension firmware must match the blobs, not the hardware).
+- validity-sensors-firmware: include 138a:0094 in the device list.
+- udev: bind 138a:0094 (and 138a:009d).
+
+With this, pairing/init/calibration complete natively; image capture and host
+matching are then handled by libfprint's vfs0090 TOD driver. Refs #72.
+---
+ bin/validity-sensors-firmware     |  2 +-
+ debian/python3-validity.udev      |  2 ++
+ validitysensor/blobs.py           |  3 ++-
+ validitysensor/firmware_tables.py |  8 ++++++++
+ validitysensor/init_flash.py      | 16 ++++++++++++++++
+ validitysensor/usb.py             |  3 +++
+ 6 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/bin/validity-sensors-firmware b/bin/validity-sensors-firmware
+index c9d357b..ea22a0f 100755
+--- a/bin/validity-sensors-firmware
++++ b/bin/validity-sensors-firmware
+@@ -3,7 +3,7 @@
+ #
+ # 2020 - Marco Trevisan
+ #
+-# Initializer for ThinkPad's validity sensors 138a:0090 and 138a:0097 and 06cb:009a
++# Initializer for Lenovo's validity sensors 138a:0090, 138a:0094, 138a:0097, 138a:009d and 06cb:009a
+ #
+ # This program is free software: you can redistribute it and/or modify
+ # it under the terms of the GNU General Public License as published by
+diff --git a/debian/python3-validity.udev b/debian/python3-validity.udev
+index d9ca628..7359081 100644
+--- a/debian/python3-validity.udev
++++ b/debian/python3-validity.udev
+@@ -2,6 +2,8 @@ SUBSYSTEM!="usb", GOTO="python_validity_end"
+ ENV{DEVTYPE}!="usb_device", GOTO="python_validity_end"
+ 
+ ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0090", GOTO="python_validity_match"
++ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0094", GOTO="python_validity_match"
++ATTRS{idVendor}=="138a", ATTRS{idProduct}=="009d", GOTO="python_validity_match"
+ ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0097", GOTO="python_validity_match"
+ ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="009a", GOTO="python_validity_match"
+ 
+diff --git a/validitysensor/blobs.py b/validitysensor/blobs.py
+index a9f16ab..054dfba 100644
+--- a/validitysensor/blobs.py
++++ b/validitysensor/blobs.py
+@@ -2,7 +2,8 @@ def __load_blob(blob: str) -> bytes:
+     from .usb import usb
+ 
+     if usb.usb_dev().idVendor == 0x138a:
+-        if usb.usb_dev().idProduct == 0x0090:
++        if usb.usb_dev().idProduct in (0x0090, 0x0094):
++            # 0094: the sensor accepts the 0090 signed blobs (same ROM v6.7; see Validity90 #15/#90)
+             from . import blobs_90 as blobs
+         elif usb.usb_dev().idProduct == 0x0097:
+             from . import blobs_97 as blobs
+diff --git a/validitysensor/firmware_tables.py b/validitysensor/firmware_tables.py
+index bd0b867..566ac2a 100644
+--- a/validitysensor/firmware_tables.py
++++ b/validitysensor/firmware_tables.py
+@@ -8,6 +8,13 @@ FIRMWARE_URIS = {
+         'referral': 'https://support.lenovo.com/us/en/downloads/DS120491',
+         'sha512': 'd839fa65adf4c952ecb4a5c4b2fc5b5bdedd8e02a421564bdc7fae1d281be4ea26fcde2333f2ab78d56cef0fdccce0a3cf429300b89544cdc9cfee6d0fe0db55'
+     },
++    SupportedDevices.DEV_94: {
++        # 0094 reuses the 0090 blobs: the xpfwext must match the blobs (not the hardware),
++        # so we use the same ThinkPad driver package as the 0090.
++        'driver': 'https://download.lenovo.com/pccbbs/mobiles/n1cgn08w.exe',
++        'referral': 'https://support.lenovo.com/us/en/downloads/DS120491',
++        'sha512': 'd839fa65adf4c952ecb4a5c4b2fc5b5bdedd8e02a421564bdc7fae1d281be4ea26fcde2333f2ab78d56cef0fdccce0a3cf429300b89544cdc9cfee6d0fe0db55'
++    },
+     SupportedDevices.DEV_97: {
+         'driver': 'https://download.lenovo.com/pccbbs/mobiles/nz3gf07w.exe',
+         'referral': 'https://download.lenovo.com/pccbbs/mobiles/nz3gf07w.exe',
+@@ -27,6 +34,7 @@ FIRMWARE_URIS = {
+ 
+ FIRMWARE_NAMES = {
+     SupportedDevices.DEV_90: '6_07f_Lenovo.xpfwext',
++    SupportedDevices.DEV_94: '6_07f_Lenovo.xpfwext',
+     SupportedDevices.DEV_97: '6_07f_lenovo_mis_qm.xpfwext',
+     SupportedDevices.DEV_9a: '6_07f_lenovo_mis_qm.xpfwext',
+     SupportedDevices.DEV_9d: '6_07f_lenovo_mis_qm.xpfwext'
+diff --git a/validitysensor/init_flash.py b/validitysensor/init_flash.py
+index 61c918b..bdbc2b6 100644
+--- a/validitysensor/init_flash.py
++++ b/validitysensor/init_flash.py
+@@ -46,6 +46,18 @@ flash_layout_hardcoded_0090 = [
+     PartitionInfo(4, 3, 5, 0x00050000, 0x00030000),  # template database
+ ]
+ 
++# 138a:0094 (Lenovo Yoga 910): captured from the vendor driver on the wire. Identical to the
++# 0090 layout EXCEPT the template DB (0xb0000 instead of 0x30000), and crucially with NO
++# appended partition signature (the partition-table TLV holds the 5 entries only, each with
++# its own SHA-256; the device validates those, not a trailing RSA signature).
++flash_layout_hardcoded_0094 = [
++    PartitionInfo(1, 4, 7, 0x00001000, 0x00001000),  # cert store
++    PartitionInfo(2, 1, 2, 0x00002000, 0x0003e000),  # xpfwext
++    PartitionInfo(5, 5, 3, 0x00040000, 0x00008000),  # ???
++    PartitionInfo(6, 6, 3, 0x00048000, 0x00008000),  # calibration data
++    PartitionInfo(4, 3, 5, 0x00050000, 0x000b0000),  # template database (0xb0000)
++]
++
+ partition_signature_0090 = unhex('''
+ e44f7a80d6137794d330b5d026c328a73c907f3f653d411255b7c2f8b425d870a8a53c6630ca864b84590e3c6786f0d69be4bbab5736388f8527237a0a86bbce
+ 7ced9450c4964709e89ac535aa00787158e0a8d9b1fb75f0f7ae53d4bd11abfcf5ee67a5a71e248a426b3aff4567048fa93de65939ccfbe3f31149a82c64fbfd
+@@ -141,6 +153,10 @@ def init_flash():
+         if usb.usb_dev().idProduct == 0x0090:
+             layout = flash_layout_hardcoded_0090
+             signature = partition_signature_0090
++        elif usb.usb_dev().idProduct == 0x0094:
++            # 0094: captured layout (DB 0xb0000) and NO appended signature.
++            layout = flash_layout_hardcoded_0094
++            signature = b''
+ 
+     partition_flash(info, layout, signature, client_public)
+ 
+diff --git a/validitysensor/usb.py b/validitysensor/usb.py
+index 464b092..b6635c7 100644
+--- a/validitysensor/usb.py
++++ b/validitysensor/usb.py
+@@ -18,6 +18,9 @@ class SupportedDevices(Enum):
+     DEV_97 = (0x138a, 0x0097)
+     DEV_9d = (0x138a, 0x009d)
+     DEV_9a = (0x06cb, 0x009a)
++    # 138a:0094 (Lenovo Yoga 910/720, IdeaPad Air 13 Pro, ...): same ROM (v6.7 build 164),
++    # same flash layout and same signed blobs as the 138a:0090.
++    DEV_94 = (0x138a, 0x0094)
+ 
+     @classmethod
+     def from_usbid(cls, vendorid, productid):
+-- 
+2.53.0
+

@@ -1,0 +1,139 @@
+#!/bin/bash
+# Checks and repairs the ITE8186 sensor hub of the Lenovo Yoga 910 after a
+# suspend. Installed by hinge/setup.sh and run after every resume by the
+# system-sleep hook; log: journalctl -t yoga-sensor-hub
+#
+#   yoga-sensor-hub-check           tell whether the hub is alive (0) or stuck (1)
+#   yoga-sensor-hub-check --power   power state of each sensor, read from the hub
+#   yoga-sensor-hub-check --fix     power the sensors back on, reset the hub if stuck
+#   yoga-sensor-hub-check --reset   reset the hub unconditionally
+HUB=i2c-ITE8186:00
+I2C_DRV=/sys/bus/i2c/drivers/i2c_hid_acpi
+CUSTOM_DRV=/sys/bus/platform/drivers/hid_sensor_custom
+HINGE_DRV=/sys/bus/platform/drivers/hid_sensor_custom_intel_hinge
+
+log() { logger -t yoga-sensor-hub "$*"; echo "$*"; }
+
+iio_by_name() {
+	local d
+	for d in /sys/bus/iio/devices/iio:device*; do
+		[ "$(cat "$d/name" 2>/dev/null)" = "$1" ] && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+# A running accelerometer always shows a few units of noise: twelve identical
+# readings in three seconds mean the hub is stuck.
+hub_alive() {
+	local a vals="" i n
+	a=$(iio_by_name accel_3d) || return 1
+	for i in $(seq 1 12); do
+		vals="$vals $(cat "$a/in_accel_x_raw" "$a/in_accel_y_raw" "$a/in_accel_z_raw" 2>/dev/null | tr '\n' /)"
+		sleep 0.25
+	done
+	n=$(echo "$vals" | tr ' ' '\n' | sed '/^$/d' | sort -u | wc -l)
+	[ "$n" -gt 1 ]
+}
+
+# Right after a hub reset, hid-sensor-custom may read the sensor model before
+# the hub is ready, and handle the hinge sensor as a generic custom sensor:
+# probe it again until the HID-SENSOR-LENOVO device exists.
+ensure_lenovo_sensor() {
+	local i custom
+	for i in $(seq 1 10); do
+		ls -d /sys/bus/platform/devices/HID-SENSOR-LENOVO-* >/dev/null 2>&1 && return 0
+		custom=$(basename "$(ls -d /sys/bus/platform/devices/HID-SENSOR-2000e1.* 2>/dev/null | head -1)")
+		if [ -n "$custom" ] && [ -e "/sys/bus/platform/devices/$custom/enable_sensor" ]; then
+			echo "$custom" > "$CUSTOM_DRV/unbind" 2>/dev/null
+			sleep 1
+			echo "$custom" > "$CUSTOM_DRV/bind" 2>/dev/null
+		fi
+		sleep 2
+	done
+	return 1
+}
+
+# Kernel bug (hid-sensor-trigger): system suspend powers the HID sensors off,
+# but resume only powers back on those with an open IIO buffer. A sensor read
+# through sysfs stays off while the kernel believes it is on, and if it is
+# read more often than its runtime autosuspend delay (3 s), nothing ever
+# powers it back on. Work around: drop that delay to zero for a moment, so
+# that the sensor runtime-suspends and is powered on again by the next read.
+resync_power() {
+	local p delay
+	for p in /sys/bus/platform/devices/HID-SENSOR-*; do
+		[ "$(cat "$p/power/runtime_status" 2>/dev/null)" = active ] || continue
+		[ -w "$p/power/autosuspend_delay_ms" ] || continue
+		delay=$(cat "$p/power/autosuspend_delay_ms" 2>/dev/null) || continue
+		echo 0 > "$p/power/autosuspend_delay_ms"
+		sleep 1.5
+		echo "$delay" > "$p/power/autosuspend_delay_ms"
+	done
+}
+
+# Actual power state in the hub: report 1 accelerometer, 2 ambient light,
+# 3 hinge. 2 = on, 6 = off (the hub numbers its enumerations from 1).
+hub_power() {
+	local h
+	h=$(grep -l 'HID_ID=0018:0000048D:00008186' /sys/class/hidraw/hidraw*/device/uevent 2>/dev/null | head -1)
+	[ -n "$h" ] || { echo "?"; return; }
+	h=/dev/$(basename "$(dirname "$(dirname "$h")")")
+	python3 - "$h" <<'PY'
+import array, fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+out = []
+for rid, name in ((1, "accelerometer"), (3, "hinge"), (2, "light")):
+    b = array.array('B', [rid] + [0] * 63)
+    try:
+        fcntl.ioctl(fd, (3 << 30) | (ord('H') << 8) | 0x07 | (64 << 16), b, True)
+        out.append(f"{name}={'on' if b[3] == 2 else 'off' if b[3] == 6 else b[3]}")
+    except OSError:
+        out.append(f"{name}=?")
+print(" ".join(out))
+PY
+}
+
+reset_hub() {
+	echo "$HUB" > "$I2C_DRV/unbind" 2>/dev/null
+	sleep 2
+	echo "$HUB" > "$I2C_DRV/bind"
+	sleep 3
+	ensure_lenovo_sensor || log "hinge sensor not recognised after the reset"
+}
+
+case "${1:-}" in
+--reset)
+	reset_hub
+	hub_alive && log "hub reset on request, alive" || log "hub reset on request, still stuck"
+	;;
+--fix)
+	if [ "${2:-}" = --after-resume ]; then
+		sleep 2
+		before=$(hub_power)
+		resync_power
+		sleep 1
+		log "resume: before [$before], after resync [$(hub_power)]"
+	fi
+	# Hinge tracked but powered off in the hub: rebind its driver
+	lenovo=$(ls -d /sys/bus/platform/devices/HID-SENSOR-LENOVO-* 2>/dev/null | head -1)
+	if [ -n "$lenovo" ] && [ "$(cat "$lenovo/power/runtime_status" 2>/dev/null)" = active ] &&
+		hub_power | grep -q 'hinge=off'; then
+		log "hinge sensor off in the hub, rebinding its driver"
+		basename "$lenovo" > "$HINGE_DRV/unbind" 2>/dev/null
+		sleep 1
+		basename "$lenovo" > "$HINGE_DRV/bind" 2>/dev/null
+		sleep 3
+	fi
+	hub_alive && exit 0
+	log "hub stuck${2:+ after resume}, resetting it"
+	reset_hub
+	sleep 2
+	hub_alive && log "hub alive again" || log "hub still stuck after the reset"
+	;;
+--power)
+	hub_power
+	;;
+*)
+	hub_alive && { echo "hub alive"; exit 0; } || { echo "hub stuck"; exit 1; }
+	;;
+esac

@@ -1,0 +1,118 @@
+From f571d149676fa2b33e0d52b4d245938fe7db7188 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Sun, 27 Sep 2026 23:05:18 +0200
+Subject: [PATCH 1/2] Add Validity 138a:0094 (Lenovo Yoga 910) match-on-host
+ support
+
+The 138a:0094 is a hardware sibling of the 138a:0090 (same ROM v6.7): a
+match-on-host sensor that captures 144x144 images matched with bozorth3 on
+the host. Pairing/init is handled by python-validity; this driver does the
+image capture and matching, exactly as it already does for the 0090.
+
+Changes:
+- id_table: add 138a:0094 with FPI_DEVICE_ACTION_CAPTURE (host matching).
+- INIT_SEQUENCES: mark the RSP5 entry weak_match. The 0094 v6.7 init reply
+  differs from the 0090 in a few informational bytes (version/module info,
+  e.g. char 37 0x0b vs 0x03); tolerate it, as the ACTIVATE_SEQUENCES do.
+- Do not treat the on-chip template DB as authoritative on match-on-host
+  devices. The 0094 answers 00 00 to the DB dump without holding any usable
+  on-chip template; that was misdetected as "enrolled fingers found", routing
+  enroll and verify through the on-chip path the sensor cannot service (enroll
+  failed with a non-NBIS print, verify never matched). Only set db_has_prints
+  when !vfs_device_supports_capture(). The 0097 (match-on-chip) is unaffected.
+- Reset enroll_stage at the start of every enroll. It lives on the device
+  object and was never cleared, so a second enroll in the same session started
+  at a stale stage, skipped the FPI_PRINT_NBIS type assignment and returned a
+  print with no type ("Driver provided incorrect print data").
+- udev: route 138a:0094 to this TOD driver.
+
+Tested on a Lenovo Yoga 910-13IKB: enroll (both index fingers, 5/5) and verify
+work; the correct finger matches (bozorth3 up to 39, threshold 12) and the
+wrong finger is rejected.
+---
+ 60-libfprint-2-tod-vfs0090.rules |  2 ++
+ vfs0090.c                        | 19 +++++++++++++++++--
+ vfs0090.h                        |  4 ++++
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/60-libfprint-2-tod-vfs0090.rules b/60-libfprint-2-tod-vfs0090.rules
+index a3f3661..8e5aa05 100644
+--- a/60-libfprint-2-tod-vfs0090.rules
++++ b/60-libfprint-2-tod-vfs0090.rules
+@@ -1,2 +1,4 @@
+ SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0090", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
+ SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0090", ENV{LIBFPRINT_DRIVER}="vfs0090"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0094", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="138a", ATTRS{idProduct}=="0094", ENV{LIBFPRINT_DRIVER}="vfs0090"
+diff --git a/vfs0090.c b/vfs0090.c
+index 665c19d..7c123b0 100644
+--- a/vfs0090.c
++++ b/vfs0090.c
+@@ -2727,15 +2727,21 @@ activate_ssm (FpiSsm *ssm, FpDevice *dev)
+     case ACTIVATE_STATE_CHECK_DB_DONE:
+       vdev->db_checked = TRUE;
+ 
++      /* Match-on-host devices (0090/0094) never use the on-chip template DB.
++       * The 0094 replies 00 00 to the DB dump without holding any usable on-chip
++       * template; treating that as "enrolled fingers found" used to route enroll
++       * and verify through the on-chip path, which the sensor cannot service
++       * (enroll then failed with a non-NBIS print, verify never matched). */
+       if (vdev->buffer_length > 4 &&
+-          vdev->buffer[0] == 0x00 && vdev->buffer[1] == 0x00)
++          vdev->buffer[0] == 0x00 && vdev->buffer[1] == 0x00 &&
++          !vfs_device_supports_capture (dev))
+         {
+           fp_dbg ("Enrolled fingers found in the internal memory");
+           vdev->db_has_prints = TRUE;
+         }
+       else
+         {
+-          fp_dbg ("No enrolled fingers found in the internal memory");
++          fp_dbg ("No on-chip enrolled fingers (or host-match device)");
+           vdev->db_has_prints = FALSE;
+         }
+ 
+@@ -2798,9 +2804,17 @@ dev_activate_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
+ static void
+ dev_activate (FpDevice *dev)
+ {
++  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+   FpiSsm *ssm;
+   FpiDeviceAction action = fpi_device_get_current_action (dev);
+ 
++  /* enroll_stage lives on the device object and is not cleared between
++   * operations; reset it here so the first stage of every enroll sets the
++   * NBIS print type (otherwise a second enroll in the same session starts at a
++   * stale stage and returns a print with no type). */
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    vdev->enroll_stage = 0;
++
+   if (action == FPI_DEVICE_ACTION_CAPTURE)
+     {
+       gboolean wait_for_finger;
+@@ -3107,6 +3121,7 @@ dev_cancel (FpDevice *dev)
+ /* Usb id table of device */
+ static const FpIdEntry id_table[] = {
+   { .vid = 0x138a, .pid = 0x0090, .driver_data = FPI_DEVICE_ACTION_CAPTURE },
++  { .vid = 0x138a, .pid = 0x0094, .driver_data = FPI_DEVICE_ACTION_CAPTURE }, /* Yoga 910, match-on-host like 0090 */
+   { .vid = 0x138a, .pid = 0x0097, .driver_data = FPI_DEVICE_ACTION_NONE },
+   { .vid = 0,  .pid = 0, .driver_data = 0 },
+ };
+diff --git a/vfs0090.h b/vfs0090.h
+index f3c2072..8ff7258 100644
+--- a/vfs0090.h
++++ b/vfs0090.h
+@@ -359,6 +359,10 @@ static const VfsDataExchange INIT_SEQUENCES[] = {
+     .msg_length = G_N_ELEMENTS (INIT_SEQUENCE_MSG5),
+     .rsp = INIT_SEQUENCE_RSP5,
+     .rsp_length = G_N_ELEMENTS (INIT_SEQUENCE_RSP5),
++    /* 138a:0094: its v6.7 init reply differs from the 0090 in informational
++     * bytes (version/module info, e.g. char 37 0x0b vs 0x03). Tolerate it,
++     * as the ACTIVATE_SEQUENCES already do. */
++    .weak_match = TRUE,
+   },
+   {
+     .msg = INIT_SEQUENCE_MSG6,
+-- 
+2.53.0
+

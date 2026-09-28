@@ -1,0 +1,153 @@
+From d060fd0a100e4a897acdcb8380a8d6c9d5c2319a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Sat, 26 Sep 2026 22:21:46 +0200
+Subject: [PATCH 1/2] HID: hid-sensor-custom: Match known custom sensors
+ without a LUID
+
+Known custom sensors are matched on the LUID found in their serial
+number property, and the beginning of the LUID gives the usage id used
+to name the platform device created for them.
+
+The ITE sensor hub of some Lenovo Yoga convertibles, like the Yoga
+910-13IKB, exposes a custom sensor without any serial number property,
+only a "Lenovo Yoga" model property, so it can not be described in the
+table of known sensors and ends up as a generic custom sensor.
+
+Make the serial number property optional, like the model and
+manufacturer ones, and allow table entries without a LUID. These are
+matched on their model instead, and provide the usage id naming their
+platform device.
+
+Add such an entry for the Lenovo Yoga sensor. It reports the hinge,
+screen and keyboard angles like the Intel ISH hinge sensor, so use the
+HID hinge usage id: its platform device is HID-SENSOR-LENOVO-020b.
+
+Assisted-by: LLM
+---
+ drivers/hid/hid-sensor-custom.c | 57 ++++++++++++++++++++-------------
+ 1 file changed, 35 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/hid/hid-sensor-custom.c b/drivers/hid/hid-sensor-custom.c
+index c2b425a..a171c1d 100644
+--- a/drivers/hid/hid-sensor-custom.c
++++ b/drivers/hid/hid-sensor-custom.c
+@@ -759,11 +759,15 @@ static void hid_sensor_custom_dev_if_remove(struct hid_sensor_custom
+ 
+ /*
+  * Match a known custom sensor.
+- * tag and luid is mandatory.
++ * tag is mandatory. Entries with a luid match sensors on their LUID, whose
++ * beginning gives the usage id naming their platform device. Entries
++ * without one match sensors on their model instead, and give that usage id
++ * in usage: model and usage are mandatory for them.
+  */
+ struct hid_sensor_custom_match {
+ 	const char *tag;
+ 	const char *luid;
++	const char *usage;
+ 	const char *model;
+ 	const char *manufacturer;
+ 	bool check_dmi;
+@@ -811,6 +815,18 @@ static const struct hid_sensor_custom_match hid_sensor_custom_known_table[] = {
+ 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+ 		}
+ 	},
++	/*
++	 * Lenovo Yoga convertibles with an ITE sensor hub
++	 */
++	{	/* hinge */
++		.tag = "LENOVO",
++		.usage = "020B",
++		.model = "Lenovo Yoga",
++		.check_dmi = true,
++		.dmi.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++		}
++	},
+ 	{}
+ };
+ 
+@@ -860,10 +876,14 @@ hid_sensor_custom_do_match(struct hid_sensor_hub_device *hsdev,
+ {
+ 	struct dmi_system_id dmi[] = { match->dmi, { 0 } };
+ 
+-	if (!hid_sensor_custom_prop_match_str(prop->serial_num, "LUID:", 5) ||
+-	    !hid_sensor_custom_prop_match_str(prop->serial_num + 5, match->luid,
+-					      HID_CUSTOM_MAX_FEATURE_BYTES - 5))
++	if (match->luid) {
++		if (!hid_sensor_custom_prop_match_str(prop->serial_num, "LUID:", 5) ||
++		    !hid_sensor_custom_prop_match_str(prop->serial_num + 5, match->luid,
++						      HID_CUSTOM_MAX_FEATURE_BYTES - 5))
++			return false;
++	} else if (!match->usage || !match->model) {
+ 		return false;
++	}
+ 
+ 	if (match->model &&
+ 	    !hid_sensor_custom_prop_match_str(prop->model, match->model,
+@@ -881,24 +901,21 @@ hid_sensor_custom_do_match(struct hid_sensor_hub_device *hsdev,
+ 	return true;
+ }
+ 
+-static int
++static void
+ hid_sensor_custom_properties_get(struct hid_sensor_hub_device *hsdev,
+ 				 struct hid_sensor_custom_properties *prop)
+ {
+-	int ret;
+-
+-	ret = hid_sensor_custom_get_prop(hsdev,
+-					 HID_USAGE_SENSOR_PROP_SERIAL_NUM,
+-					 HID_CUSTOM_MAX_FEATURE_BYTES,
+-					 prop->serial_num);
+-	if (ret < 0)
+-		return ret;
+-
+ 	/*
+-	 * Ignore errors on the following model and manufacturer properties.
+-	 * Because these are optional, it is not an error if they are missing.
++	 * Ignore errors on the following properties. Because these are
++	 * optional, it is not an error if they are missing: the buffer of a
++	 * missing property is left zeroed, and only matches table entries
++	 * which do not use it.
+ 	 */
+ 
++	hid_sensor_custom_get_prop(hsdev, HID_USAGE_SENSOR_PROP_SERIAL_NUM,
++				   HID_CUSTOM_MAX_FEATURE_BYTES,
++				   prop->serial_num);
++
+ 	hid_sensor_custom_get_prop(hsdev, HID_USAGE_SENSOR_PROP_MODEL,
+ 				   HID_CUSTOM_MAX_FEATURE_BYTES,
+ 				   prop->model);
+@@ -906,8 +923,6 @@ hid_sensor_custom_properties_get(struct hid_sensor_hub_device *hsdev,
+ 	hid_sensor_custom_get_prop(hsdev, HID_USAGE_SENSOR_PROP_MANUFACTURER,
+ 				   HID_CUSTOM_MAX_FEATURE_BYTES,
+ 				   prop->manufacturer);
+-
+-	return 0;
+ }
+ 
+ static int
+@@ -923,9 +938,7 @@ hid_sensor_custom_get_known(struct hid_sensor_hub_device *hsdev,
+ 	if (!prop)
+ 		return -ENOMEM;
+ 
+-	ret = hid_sensor_custom_properties_get(hsdev, prop);
+-	if (ret < 0)
+-		goto out;
++	hid_sensor_custom_properties_get(hsdev, prop);
+ 
+ 	while (match->tag) {
+ 		if (hid_sensor_custom_do_match(hsdev, match, prop)) {
+@@ -951,7 +964,7 @@ hid_sensor_register_platform_device(struct platform_device *pdev,
+ 	const char *dev_name;
+ 	char *c;
+ 
+-	memcpy(real_usage, match->luid, 4);
++	memcpy(real_usage, match->luid ?: match->usage, 4);
+ 
+ 	/* usage id are all lowercase */
+ 	for (c = real_usage; *c != '\0'; c++)
+-- 
+2.53.0
+

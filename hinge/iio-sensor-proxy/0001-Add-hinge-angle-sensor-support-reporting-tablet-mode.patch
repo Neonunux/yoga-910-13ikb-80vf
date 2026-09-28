@@ -1,0 +1,1100 @@
+From a8501e9dc9003b0153cff5f021af0c534aa083fd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Mon, 28 Sep 2026 22:22:44 +0200
+Subject: [PATCH] Add hinge angle sensor support, reporting tablet mode
+
+Read the hinge angle of convertibles from IIO hinge sensors, like the ones
+of hid-sensor-custom-intel-hinge, and report laptop or tablet mode through
+a uinput SW_TABLET_MODE switch, as suggested in #318: libinput handles it
+like a kernel provided switch, and desktops switch to their tablet mode.
+
+- drv-iio-poll-hinge polls the in_angl0 channel labelled "hinge" every
+  100 ms, after letting the sensor settle for 1.5 s when started;
+- tablet mode is reported from 200 degrees and laptop mode up to 170, after
+  two readings; a closed lid and a tablet folded flat, which look the same
+  to the sensors, are told apart by where the hinge came from, the lid
+  switch only deciding on startup;
+- the switch is not created if the kernel already reports tablet mode;
+- the hinge is tracked whether or not clients claimed sensors, and keeps
+  the accelerometer running: the ITE sensor hub of Lenovo Yoga convertibles
+  only updates the hinge angle while it is enabled.
+
+Tested on a Lenovo Yoga 910-13IKB.
+
+Closes: #318
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ data/80-iio-sensor-proxy.rules |   1 +
+ src/drivers.h                  |   7 ++
+ src/drv-iio-poll-hinge.c       | 161 ++++++++++++++++++++++++++++++
+ src/hinge.c                    | 138 +++++++++++++++++++++++++
+ src/hinge.h                    |  39 ++++++++
+ src/iio-sensor-proxy.c         | 109 +++++++++++++++++++-
+ src/meson.build                |  11 ++
+ src/tablet-mode.c              | 170 +++++++++++++++++++++++++++++++
+ src/tablet-mode.h              |  26 +++++
+ src/test-hinge.c               | 177 +++++++++++++++++++++++++++++++++
+ 10 files changed, 836 insertions(+), 3 deletions(-)
+ create mode 100644 src/drv-iio-poll-hinge.c
+ create mode 100644 src/hinge.c
+ create mode 100644 src/hinge.h
+ create mode 100644 src/tablet-mode.c
+ create mode 100644 src/tablet-mode.h
+ create mode 100644 src/test-hinge.c
+
+diff --git a/data/80-iio-sensor-proxy.rules b/data/80-iio-sensor-proxy.rules
+index fa8a4b3..9d789fa 100644
+--- a/data/80-iio-sensor-proxy.rules
++++ b/data/80-iio-sensor-proxy.rules
+@@ -17,6 +17,7 @@ SUBSYSTEM=="iio", TEST=="scan_elements/in_intensity_both_en", ENV{IIO_SENSOR_PRO
+ SUBSYSTEM=="iio", TEST=="in_proximity_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-proximity"
+ SUBSYSTEM=="iio", TEST=="in_proximity0_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-proximity"
+ SUBSYSTEM=="input", ENV{ID_INPUT_ACCELEROMETER}=="1", ENV{IIO_SENSOR_PROXY_TYPE}+="input-accel"
++SUBSYSTEM=="iio", ATTR{name}=="hinge", ATTR{in_angl0_label}=="hinge", TEST=="in_angl0_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-hinge"
+ 
+ # Set the sensor type for all the types we recognise for SDSP/ADSP with libssc.
+ # Some devices expose the sensors via a separate SDSP while others re-use ADSP.
+diff --git a/src/drivers.h b/src/drivers.h
+index 5e0347c..2b492e0 100644
+--- a/src/drivers.h
++++ b/src/drivers.h
+@@ -17,6 +17,7 @@ typedef enum {
+ 	DRIVER_TYPE_LIGHT,
+ 	DRIVER_TYPE_COMPASS,
+ 	DRIVER_TYPE_PROXIMITY,
++	DRIVER_TYPE_HINGE,
+ } DriverType;
+ 
+ typedef enum {
+@@ -47,6 +48,11 @@ typedef struct {
+ 	ProximityNear is_near;
+ } ProximityReadings;
+ 
++typedef struct {
++	/* Degrees between the screen and the keyboard, 0 with the lid closed */
++	gdouble angle;
++} HingeReadings;
++
+ typedef void (*ReadingsUpdateFunc) (SensorDevice *sensor_device,
+ 				    gpointer      readings,
+ 				    gpointer      user_data);
+@@ -160,6 +166,7 @@ extern SensorDriver iio_buffer_light;
+ extern SensorDriver iio_buffer_compass;
+ extern SensorDriver iio_poll_proximity;
+ extern SensorDriver input_proximity;
++extern SensorDriver iio_poll_hinge;
+ 
+ #ifdef HAS_LIBSSC
+ extern SensorDriver ssc_proximity;
+diff --git a/src/drv-iio-poll-hinge.c b/src/drv-iio-poll-hinge.c
+new file mode 100644
+index 0000000..55b6fb3
+--- /dev/null
++++ b/src/drv-iio-poll-hinge.c
+@@ -0,0 +1,161 @@
++/*
++ * Copyright (c) 2014 Bastien Nocera <hadess@hadess.net>
++ * Copyright (c) 2026 Régis LELOUP <neonunux@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ */
++
++#include "drivers.h"
++
++#include <math.h>
++
++/* Fast enough to see a quickly folded hinge cross the tablet range */
++#define POLL_INTERVAL_MS 100
++
++/* Sensor hubs can report stale angles for a moment after being powered on */
++#define SETTLE_TIME_US (1500 * G_TIME_SPAN_MILLISECOND)
++
++typedef struct DrvData {
++	char     *input_path;
++	guint     timeout_id;
++	gint64    started;
++	gboolean  read_failed;
++
++	double    scale;
++	double    offset;
++} DrvData;
++
++static gboolean
++iio_poll_hinge_discover (GUdevDevice *device)
++{
++	return drv_check_udev_sensor_type (device, "iio-poll-hinge", "IIO poll hinge");
++}
++
++static gboolean
++hinge_changed (gpointer user_data)
++{
++	SensorDevice *sensor_device = user_data;
++	DrvData *drv_data = (DrvData *) sensor_device->priv;
++	HingeReadings readings;
++	g_autofree char *contents = NULL;
++	g_autoptr(GError) error = NULL;
++	gdouble raw;
++
++	if (!g_file_get_contents (drv_data->input_path, &contents, NULL, &error)) {
++		if (!drv_data->read_failed)
++			g_warning ("Failed to read hinge angle from %s at %s: %s",
++				   sensor_device->name, drv_data->input_path, error->message);
++		drv_data->read_failed = TRUE;
++		return G_SOURCE_CONTINUE;
++	}
++	drv_data->read_failed = FALSE;
++	if (g_get_monotonic_time () - drv_data->started < SETTLE_TIME_US)
++		return G_SOURCE_CONTINUE;
++	raw = g_ascii_strtod (contents, NULL);
++
++	/* IIO angles are in radians */
++	readings.angle = fmod ((raw + drv_data->offset) * drv_data->scale * 180.0 / G_PI, 360.0);
++	if (readings.angle < 0.0)
++		readings.angle += 360.0;
++	g_debug ("Hinge angle read from %s: %lf (scale %lf, offset %lf) = %.1lf degrees",
++		 sensor_device->name, raw, drv_data->scale, drv_data->offset, readings.angle);
++
++	sensor_device->callback_func (sensor_device, (gpointer) &readings, sensor_device->user_data);
++
++	return G_SOURCE_CONTINUE;
++}
++
++static void
++iio_poll_hinge_set_polling (SensorDevice *sensor_device,
++			    gboolean      state)
++{
++	DrvData *drv_data = (DrvData *) sensor_device->priv;
++
++	if (drv_data->timeout_id > 0 && state)
++		return;
++	if (drv_data->timeout_id == 0 && !state)
++		return;
++
++	if (drv_data->timeout_id) {
++		g_source_remove (drv_data->timeout_id);
++		drv_data->timeout_id = 0;
++	}
++
++	if (state) {
++		drv_data->started = g_get_monotonic_time ();
++		drv_data->timeout_id = g_timeout_add (POLL_INTERVAL_MS,
++						      (GSourceFunc) hinge_changed,
++						      sensor_device);
++		g_source_set_name_by_id (drv_data->timeout_id, "[iio_poll_hinge_set_polling] hinge_changed");
++
++		hinge_changed (sensor_device);
++	}
++}
++
++/* Channel attributes can be specific to the channel or shared by type */
++static gdouble
++get_channel_attr (GUdevDevice *device,
++		  const char  *attr,
++		  gdouble      default_value)
++{
++	g_autofree char *indexed = NULL;
++	g_autofree char *shared = NULL;
++
++	indexed = g_strdup_printf ("in_angl0_%s", attr);
++	if (g_udev_device_has_sysfs_attr (device, indexed))
++		return g_udev_device_get_sysfs_attr_as_double (device, indexed);
++	shared = g_strdup_printf ("in_angl_%s", attr);
++	if (g_udev_device_has_sysfs_attr (device, shared))
++		return g_udev_device_get_sysfs_attr_as_double (device, shared);
++	return default_value;
++}
++
++static SensorDevice *
++iio_poll_hinge_open (GUdevDevice *device)
++{
++	SensorDevice *sensor_device;
++	DrvData *drv_data;
++	g_autofree char *input_path = NULL;
++
++	input_path = g_build_filename (g_udev_device_get_sysfs_path (device),
++				       "in_angl0_raw", NULL);
++	if (!g_file_test (input_path, G_FILE_TEST_EXISTS))
++		return NULL;
++
++	sensor_device = g_new0 (SensorDevice, 1);
++	sensor_device->name = g_strdup (g_udev_device_get_property (device, "NAME"));
++	if (!sensor_device->name)
++		sensor_device->name = g_strdup (g_udev_device_get_name (device));
++	sensor_device->priv = g_new0 (DrvData, 1);
++	drv_data = (DrvData *) sensor_device->priv;
++
++	drv_data->scale = get_channel_attr (device, "scale", 1.0);
++	if (drv_data->scale == 0.0)
++		drv_data->scale = 1.0;
++	drv_data->offset = get_channel_attr (device, "offset", 0.0);
++	drv_data->input_path = g_steal_pointer (&input_path);
++
++	return sensor_device;
++}
++
++static void
++iio_poll_hinge_close (SensorDevice *sensor_device)
++{
++	DrvData *drv_data = (DrvData *) sensor_device->priv;
++
++	g_clear_pointer (&drv_data->input_path, g_free);
++	g_clear_pointer (&sensor_device->priv, g_free);
++	g_free (sensor_device);
++}
++
++SensorDriver iio_poll_hinge = {
++	.driver_name = "IIO Polling Hinge sensor",
++	.type = DRIVER_TYPE_HINGE,
++
++	.discover = iio_poll_hinge_discover,
++	.open = iio_poll_hinge_open,
++	.set_polling = iio_poll_hinge_set_polling,
++	.close = iio_poll_hinge_close,
++};
+diff --git a/src/hinge.c b/src/hinge.c
+new file mode 100644
+index 0000000..f9d4020
+--- /dev/null
++++ b/src/hinge.c
+@@ -0,0 +1,138 @@
++/*
++ * Copyright (c) 2026 Régis LELOUP <neonunux@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ */
++
++#include "hinge.h"
++
++/*
++ * Hinge angles are in degrees, from 0 with the lid closed to 360 with the
++ * screen folded against the bottom of the keyboard. In the latter position,
++ * sensors wrap around to 0: readings close to 0 mean either a closed lid or
++ * a tablet folded flat.
++ *
++ * Tent and stand postures, like tablets, leave the keyboard unusable, so
++ * all of them are reported as tablet mode.
++ */
++#define TABLET_ENTER_ANGLE	200.0
++#define TABLET_LEAVE_ANGLE	170.0
++#define FOLDED_ANGLE		 30.0
++
++/* Consecutive readings required to change mode */
++#define DEBOUNCE_READINGS	2
++
++void
++hinge_state_init (HingeState *state)
++{
++	state->mode = HINGE_MODE_UNDEFINED;
++	state->candidate = HINGE_MODE_UNDEFINED;
++	state->candidate_count = 0;
++	state->last_unfolded_angle = -1.0;
++}
++
++gboolean
++hinge_angle_is_folded (gdouble angle)
++{
++	return angle < FOLDED_ANGLE;
++}
++
++static HingeMode
++wanted_mode (const HingeState *state,
++	     gdouble           angle,
++	     LidState          lid)
++{
++	HingeMode current = state->mode;
++
++	if (hinge_angle_is_folded (angle)) {
++		/* A closed lid and a tablet folded flat look the same to the
++		 * sensors, what tells them apart is where the hinge came from:
++		 * the tablet range means it wrapped around past 360 degrees,
++		 * even if folded too fast for the tablet mode to be confirmed
++		 * already. Otherwise, keep the current mode rather than trust a
++		 * single reading, which may be off while the device moves. */
++		if (state->last_unfolded_angle >= TABLET_ENTER_ANGLE)
++			return HINGE_MODE_TABLET;
++		if (current != HINGE_MODE_UNDEFINED)
++			return current;
++
++		/* On startup, rely on the lid switch. It may report a closed lid
++		 * when folded flat on some convertibles, so it is not trusted
++		 * afterwards. */
++		switch (lid) {
++		case LID_STATE_OPEN:
++			return HINGE_MODE_TABLET;
++		case LID_STATE_CLOSED:
++			return HINGE_MODE_LAPTOP;
++		case LID_STATE_UNKNOWN:
++		default:
++			return HINGE_MODE_UNDEFINED;
++		}
++	}
++
++	if (angle >= TABLET_ENTER_ANGLE)
++		return HINGE_MODE_TABLET;
++	if (angle <= TABLET_LEAVE_ANGLE)
++		return HINGE_MODE_LAPTOP;
++
++	/* Between the thresholds, like a laptop opened flat */
++	if (current != HINGE_MODE_UNDEFINED)
++		return current;
++	return HINGE_MODE_LAPTOP;
++}
++
++/* Returns TRUE when the mode changed */
++gboolean
++hinge_state_update (HingeState *state,
++		    gdouble     angle,
++		    LidState    lid)
++{
++	HingeMode wanted;
++	gboolean folded_over;
++
++	wanted = wanted_mode (state, angle, lid);
++	folded_over = hinge_angle_is_folded (angle) &&
++		      state->last_unfolded_angle >= TABLET_ENTER_ANGLE;
++	if (!hinge_angle_is_folded (angle))
++		state->last_unfolded_angle = angle;
++
++	if (wanted == HINGE_MODE_UNDEFINED || wanted == state->mode) {
++		state->candidate_count = 0;
++		return FALSE;
++	}
++
++	/* Start with the first reading, and do not wait for more readings
++	 * once the hinge wrapped around: the tablet range was crossed */
++	if (state->mode == HINGE_MODE_UNDEFINED || folded_over) {
++		state->mode = wanted;
++		state->candidate_count = 0;
++		return TRUE;
++	}
++
++	if (state->candidate != wanted) {
++		state->candidate = wanted;
++		state->candidate_count = 0;
++	}
++	if (++state->candidate_count < DEBOUNCE_READINGS)
++		return FALSE;
++
++	state->mode = wanted;
++	state->candidate_count = 0;
++	return TRUE;
++}
++
++const char *
++hinge_mode_to_string (HingeMode mode)
++{
++	switch (mode) {
++	case HINGE_MODE_LAPTOP:
++		return "laptop";
++	case HINGE_MODE_TABLET:
++		return "tablet";
++	case HINGE_MODE_UNDEFINED:
++	default:
++		return "undefined";
++	}
++}
+diff --git a/src/hinge.h b/src/hinge.h
+new file mode 100644
+index 0000000..d13ed45
+--- /dev/null
++++ b/src/hinge.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (c) 2026 Régis LELOUP <neonunux@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ */
++
++#pragma once
++
++#include <glib.h>
++
++typedef enum {
++	HINGE_MODE_UNDEFINED = 0,
++	HINGE_MODE_LAPTOP,
++	HINGE_MODE_TABLET,
++} HingeMode;
++
++typedef enum {
++	LID_STATE_UNKNOWN = -1,
++	LID_STATE_OPEN    =  0,
++	LID_STATE_CLOSED  =  1,
++} LidState;
++
++typedef struct {
++	HingeMode mode;
++	HingeMode candidate;
++	guint     candidate_count;
++
++	/* Last reading outside the folded range, -1 if none yet */
++	gdouble   last_unfolded_angle;
++} HingeState;
++
++void        hinge_state_init      (HingeState *state);
++gboolean    hinge_state_update    (HingeState *state,
++				   gdouble     angle,
++				   LidState    lid);
++gboolean    hinge_angle_is_folded (gdouble     angle);
++const char *hinge_mode_to_string  (HingeMode   mode);
+diff --git a/src/iio-sensor-proxy.c b/src/iio-sensor-proxy.c
+index 9c7e8cd..c94b0e3 100644
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -23,6 +23,8 @@
+ #include <polkit/polkit.h>
+ #include "drivers.h"
+ #include "orientation.h"
++#include "hinge.h"
++#include "tablet-mode.h"
+ 
+ #include "iio-sensor-proxy-resources.h"
+ 
+@@ -32,7 +34,7 @@
+ #define SENSOR_PROXY_IFACE_NAME         SENSOR_PROXY_DBUS_NAME
+ #define SENSOR_PROXY_COMPASS_IFACE_NAME SENSOR_PROXY_DBUS_NAME ".Compass"
+ 
+-#define NUM_SENSOR_TYPES DRIVER_TYPE_PROXIMITY + 1
++#define NUM_SENSOR_TYPES DRIVER_TYPE_HINGE + 1
+ 
+ typedef struct {
+ 	GMainLoop *loop;
+@@ -65,6 +67,11 @@ typedef struct {
+ 
+ 	/* Proximity */
+ 	gboolean previous_prox_near;
++
++	/* Hinge */
++	gboolean          hinge_active;
++	HingeState        hinge_state;
++	TabletModeSwitch *tablet_mode_switch;
+ } SensorData;
+ 
+ static const SensorDriver * const drivers[] = {
+@@ -79,6 +86,7 @@ static const SensorDriver * const drivers[] = {
+ 	&iio_buffer_compass,
+ 	&iio_poll_proximity,
+ 	&input_proximity,
++	&iio_poll_hinge,
+ #ifdef HAS_LIBSSC
+ 	&ssc_proximity,
+ 	&ssc_light,
+@@ -88,6 +96,8 @@ static const SensorDriver * const drivers[] = {
+ };
+ 
+ static ReadingsUpdateFunc driver_type_to_callback_func (DriverType type);
++static void hinge_start (SensorData *data);
++static void hinge_stop  (SensorData *data);
+ 
+ static const char *
+ driver_type_to_str (DriverType type)
+@@ -101,6 +111,8 @@ driver_type_to_str (DriverType type)
+ 		return "compass";
+ 	case DRIVER_TYPE_PROXIMITY:
+ 		return "proximity";
++	case DRIVER_TYPE_HINGE:
++		return "hinge angle sensor";
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -163,7 +175,8 @@ find_sensors (GUdevClient *client,
+ 		if (driver_type_exists (data, DRIVER_TYPE_ACCEL) &&
+ 		    driver_type_exists (data, DRIVER_TYPE_LIGHT) &&
+ 		    driver_type_exists (data, DRIVER_TYPE_PROXIMITY) &&
+-		    driver_type_exists (data, DRIVER_TYPE_COMPASS))
++		    driver_type_exists (data, DRIVER_TYPE_COMPASS) &&
++		    driver_type_exists (data, DRIVER_TYPE_HINGE))
+ 			break;
+ 	}
+ 
+@@ -227,6 +240,9 @@ mask_for_sensor_type (DriverType sensor_type)
+ 	case DRIVER_TYPE_PROXIMITY:
+ 		return PROP_HAS_PROXIMITY |
+ 			PROP_PROXIMITY_NEAR;
++	case DRIVER_TYPE_HINGE:
++		/* Reported through the tablet mode switch, not over D-Bus */
++		return 0;
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -385,6 +401,8 @@ send_driver_changed_dbus_event (SensorData   *data,
+ 		send_dbus_event (data, PROP_HAS_PROXIMITY);
+ 	else if (driver_type == DRIVER_TYPE_COMPASS)
+ 		send_dbus_event (data, PROP_HAS_COMPASS);
++	else if (driver_type == DRIVER_TYPE_HINGE)
++		return;
+ 	else
+ 		g_assert_not_reached ();
+ }
+@@ -423,6 +441,10 @@ client_release (SensorData            *data,
+ 
+ 	g_hash_table_remove (ht, sender);
+ 
++	/* The hinge keeps the accelerometer running, see hinge_start() */
++	if (driver_type == DRIVER_TYPE_ACCEL && data->hinge_active)
++		return;
++
+ 	if (driver_type_exists (data, driver_type) &&
+ 	    g_hash_table_size (ht) == 0) {
+ 		SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+@@ -784,6 +806,9 @@ name_acquired_handler (GDBusConnection *connection,
+ 	if (!any_sensors_left (data))
+ 		goto bail;
+ 
++	if (driver_type_exists (data, DRIVER_TYPE_HINGE))
++		hinge_start (data);
++
+ 	send_dbus_event (data, PROP_ALL);
+ 	send_dbus_event (data, PROP_ALL_COMPASS);
+ 	return;
+@@ -975,6 +1000,73 @@ proximity_changed_func (SensorDevice *sensor_device,
+ 	maybe_notify_sensor_startup_finished (data, DRIVER_TYPE_PROXIMITY);
+ }
+ 
++static void
++hinge_changed_func (SensorDevice *sensor_device,
++		    gpointer      readings_data,
++		    gpointer      user_data)
++{
++	SensorData *data = user_data;
++	HingeReadings *readings = (HingeReadings *) readings_data;
++	LidState lid = LID_STATE_UNKNOWN;
++
++	/* The lid switch only matters to tell a closed lid from a tablet
++	 * folded flat on the first reading */
++	if (data->hinge_state.mode == HINGE_MODE_UNDEFINED &&
++	    hinge_angle_is_folded (readings->angle))
++		lid = tablet_mode_get_lid_state (data->client);
++
++	if (!hinge_state_update (&data->hinge_state, readings->angle, lid))
++		return;
++
++	g_message ("Hinge at %.0f degrees, reporting %s mode",
++		   readings->angle, hinge_mode_to_string (data->hinge_state.mode));
++
++	if (data->tablet_mode_switch == NULL)
++		data->tablet_mode_switch = tablet_mode_switch_new ();
++	if (data->tablet_mode_switch != NULL)
++		tablet_mode_switch_set (data->tablet_mode_switch,
++					data->hinge_state.mode == HINGE_MODE_TABLET);
++}
++
++/* Unlike other sensors, the hinge is not claimed by clients: it drives the
++ * tablet mode switch for as long as it is present, unless a kernel driver
++ * already reports tablet mode. */
++static void
++hinge_start (SensorData *data)
++{
++	SensorDevice *sensor_device = DEVICE_FOR_TYPE(DRIVER_TYPE_HINGE);
++
++	if (tablet_mode_native_switch_exists (data->client)) {
++		g_message ("Tablet mode is already reported by the kernel, not using %s",
++			   sensor_device->name);
++		return;
++	}
++
++	g_message ("Reporting tablet mode from %s", sensor_device->name);
++	hinge_state_init (&data->hinge_state);
++	driver_set_polling (sensor_device, TRUE);
++
++	/* Some sensor hubs derive the hinge angle from their accelerometers, and
++	 * only update it while the display accelerometer is enabled, like the
++	 * ITE hub of Lenovo Yoga convertibles: keep it running along. */
++	data->hinge_active = TRUE;
++	if (driver_type_exists (data, DRIVER_TYPE_ACCEL))
++		driver_set_polling (DEVICE_FOR_TYPE(DRIVER_TYPE_ACCEL), TRUE);
++}
++
++static void
++hinge_stop (SensorData *data)
++{
++	g_clear_pointer (&data->tablet_mode_switch, tablet_mode_switch_free);
++	hinge_state_init (&data->hinge_state);
++
++	if (data->hinge_active &&
++	    driver_type_exists (data, DRIVER_TYPE_ACCEL) &&
++	    g_hash_table_size (data->clients[DRIVER_TYPE_ACCEL]) == 0)
++		driver_set_polling (DEVICE_FOR_TYPE(DRIVER_TYPE_ACCEL), FALSE);
++	data->hinge_active = FALSE;
++}
++
+ static ReadingsUpdateFunc
+ driver_type_to_callback_func (DriverType type)
+ {
+@@ -987,6 +1079,8 @@ driver_type_to_callback_func (DriverType type)
+ 		return compass_changed_func;
+ 	case DRIVER_TYPE_PROXIMITY:
+ 		return proximity_changed_func;
++	case DRIVER_TYPE_HINGE:
++		return hinge_changed_func;
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -1013,6 +1107,7 @@ free_sensor_data (SensorData *data)
+ 		g_clear_pointer (&data->sensor_startup_dbus_invocations_delayed[i], g_ptr_array_unref);
+ 	}
+ 
++	g_clear_pointer (&data->tablet_mode_switch, tablet_mode_switch_free);
+ 	g_clear_object (&data->auth);
+ 	g_clear_pointer (&data->introspection_data, g_dbus_node_info_unref);
+ 	g_clear_object (&data->connection);
+@@ -1049,6 +1144,9 @@ sensor_changes (GUdevClient *client,
+ 				DEVICE_FOR_TYPE(i) = NULL;
+ 				DRIVER_FOR_TYPE(i) = NULL;
+ 
++				if (i == DRIVER_TYPE_HINGE)
++					hinge_stop (data);
++
+ 				g_clear_pointer (&data->clients[i], g_hash_table_unref);
+ 				data->clients[i] = create_clients_hash_table ();
+ 
+@@ -1103,7 +1201,9 @@ sensor_changes (GUdevClient *client,
+ 
+ 					ht = data->clients[driver->type];
+ 
+-					if (g_hash_table_size (ht) > 0) {
++					if (driver->type == DRIVER_TYPE_HINGE) {
++						hinge_start (data);
++					} else if (g_hash_table_size (ht) > 0) {
+ 						SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver->type);
+ 
+ 						/* Sensor just appeared but it's already claimed by some clients. Wait
+@@ -1115,6 +1215,9 @@ sensor_changes (GUdevClient *client,
+ 					} else {
+ 						send_driver_changed_dbus_event (data, driver->type);
+ 					}
++
++					if (driver->type == DRIVER_TYPE_ACCEL && data->hinge_active)
++						driver_set_polling (sensor_device, TRUE);
+ 				}
+ 				break;
+ 			}
+diff --git a/src/meson.build b/src/meson.build
+index 3337e24..f6319a9 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -36,6 +36,9 @@ sources = [
+   'drv-iio-buffer-compass.c',
+   'drv-iio-poll-proximity.c',
+   'drv-input-proximity.c',
++  'drv-iio-poll-hinge.c',
++  'hinge.c',
++  'tablet-mode.c',
+   'iio-buffer-utils.c',
+   'accel-mount-matrix.c',
+   'accel-scale.c',
+@@ -83,6 +86,14 @@ test_orientation = executable('test-orientation',
+ 
+ test('test-orientation', test_orientation)
+ 
++test_hinge = executable('test-hinge',
++  [ 'test-hinge.c', 'hinge.c' ],
++  dependencies: deps,
++  install: false
++)
++
++test('test-hinge', test_hinge)
++
+ if get_option('gtk-tests')
+   executable('test-orientation-gtk',
+     [ 'test-orientation-gtk.c', 'orientation.c', 'accel-scale.c' ],
+diff --git a/src/tablet-mode.c b/src/tablet-mode.c
+new file mode 100644
+index 0000000..279b140
+--- /dev/null
++++ b/src/tablet-mode.c
+@@ -0,0 +1,170 @@
++/*
++ * Copyright (c) 2026 Régis LELOUP <neonunux@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ */
++
++#include "tablet-mode.h"
++
++#include <glib/gstdio.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <linux/input.h>
++#include <linux/uinput.h>
++
++#define SWITCH_NAME "iio-sensor-proxy tablet mode switch"
++
++struct TabletModeSwitch {
++	int fd;
++};
++
++/* The "capabilities/sw" attribute of input devices is a hexadecimal bitmask */
++static gboolean
++input_device_has_switch (GUdevDevice *device,
++			 guint        code)
++{
++	const char *caps;
++	guint64 bits;
++
++	caps = g_udev_device_get_sysfs_attr (device, "capabilities/sw");
++	if (caps == NULL)
++		return FALSE;
++	bits = g_ascii_strtoull (caps, NULL, 16);
++	return (bits >> code) & 1;
++}
++
++static gboolean
++input_device_is_ours (GUdevDevice *device)
++{
++	return g_strcmp0 (g_udev_device_get_sysfs_attr (device, "name"), SWITCH_NAME) == 0;
++}
++
++gboolean
++tablet_mode_native_switch_exists (GUdevClient *client)
++{
++	g_autolist(GUdevDevice) devices = NULL;
++	GList *l;
++
++	devices = g_udev_client_query_by_subsystem (client, "input");
++	for (l = devices; l != NULL; l = l->next) {
++		GUdevDevice *dev = l->data;
++
++		if (!g_str_has_prefix (g_udev_device_get_name (dev), "input"))
++			continue;
++		if (input_device_has_switch (dev, SW_TABLET_MODE) &&
++		    !input_device_is_ours (dev)) {
++			g_debug ("Found native tablet mode switch '%s' at %s",
++				 g_udev_device_get_sysfs_attr (dev, "name"),
++				 g_udev_device_get_sysfs_path (dev));
++			return TRUE;
++		}
++	}
++	return FALSE;
++}
++
++static LidState
++read_lid_state (const char *device_file)
++{
++	guint8 bits[SW_MAX / 8 + 1] = { 0 };
++	g_autofd int fd = -1;
++
++	fd = open (device_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0) {
++		g_debug ("Could not open lid switch %s: %s", device_file, g_strerror (errno));
++		return LID_STATE_UNKNOWN;
++	}
++	if (ioctl (fd, EVIOCGSW (sizeof (bits)), bits) < 0) {
++		g_debug ("Could not read lid switch %s: %s", device_file, g_strerror (errno));
++		return LID_STATE_UNKNOWN;
++	}
++	return (bits[SW_LID / 8] & (1 << (SW_LID % 8))) ? LID_STATE_CLOSED : LID_STATE_OPEN;
++}
++
++LidState
++tablet_mode_get_lid_state (GUdevClient *client)
++{
++	g_autolist(GUdevDevice) devices = NULL;
++	GList *l;
++
++	devices = g_udev_client_query_by_subsystem (client, "input");
++	for (l = devices; l != NULL; l = l->next) {
++		GUdevDevice *dev = l->data;
++		g_autoptr(GUdevDevice) parent = NULL;
++		const char *device_file;
++
++		if (!g_str_has_prefix (g_udev_device_get_name (dev), "event"))
++			continue;
++		device_file = g_udev_device_get_device_file (dev);
++		parent = g_udev_device_get_parent (dev);
++		if (device_file == NULL || parent == NULL ||
++		    !input_device_has_switch (parent, SW_LID))
++			continue;
++		return read_lid_state (device_file);
++	}
++	return LID_STATE_UNKNOWN;
++}
++
++TabletModeSwitch *
++tablet_mode_switch_new (void)
++{
++	struct uinput_setup setup = { 0 };
++	TabletModeSwitch *tablet_switch;
++	g_autofd int fd = -1;
++
++	fd = open ("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0) {
++		g_warning ("Could not open /dev/uinput to report tablet mode: %s",
++			   g_strerror (errno));
++		return NULL;
++	}
++
++	setup.id.bustype = BUS_VIRTUAL;
++	g_strlcpy (setup.name, SWITCH_NAME, sizeof (setup.name));
++
++	if (ioctl (fd, UI_SET_EVBIT, EV_SW) < 0 ||
++	    ioctl (fd, UI_SET_SWBIT, SW_TABLET_MODE) < 0 ||
++	    ioctl (fd, UI_DEV_SETUP, &setup) < 0 ||
++	    ioctl (fd, UI_DEV_CREATE) < 0) {
++		g_warning ("Could not create the tablet mode switch: %s",
++			   g_strerror (errno));
++		return NULL;
++	}
++
++	tablet_switch = g_new0 (TabletModeSwitch, 1);
++	tablet_switch->fd = g_steal_fd (&fd);
++	return tablet_switch;
++}
++
++void
++tablet_mode_switch_set (TabletModeSwitch *tablet_switch,
++			gboolean          tablet_mode)
++{
++	struct input_event events[2];
++
++	g_return_if_fail (tablet_switch != NULL);
++
++	memset (events, 0, sizeof (events));
++	events[0].type = EV_SW;
++	events[0].code = SW_TABLET_MODE;
++	events[0].value = tablet_mode ? 1 : 0;
++	events[1].type = EV_SYN;
++	events[1].code = SYN_REPORT;
++
++	if (write (tablet_switch->fd, events, sizeof (events)) != sizeof (events))
++		g_warning ("Could not report tablet mode: %s", g_strerror (errno));
++}
++
++void
++tablet_mode_switch_free (TabletModeSwitch *tablet_switch)
++{
++	if (tablet_switch == NULL)
++		return;
++	ioctl (tablet_switch->fd, UI_DEV_DESTROY);
++	close (tablet_switch->fd);
++	g_free (tablet_switch);
++}
+diff --git a/src/tablet-mode.h b/src/tablet-mode.h
+new file mode 100644
+index 0000000..a5a28dd
+--- /dev/null
++++ b/src/tablet-mode.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (c) 2026 Régis LELOUP <neonunux@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ */
++
++#pragma once
++
++#include <glib.h>
++#include <gudev/gudev.h>
++
++#include "hinge.h"
++
++typedef struct TabletModeSwitch TabletModeSwitch;
++
++gboolean          tablet_mode_native_switch_exists (GUdevClient      *client);
++LidState          tablet_mode_get_lid_state        (GUdevClient      *client);
++
++TabletModeSwitch *tablet_mode_switch_new           (void);
++void              tablet_mode_switch_set           (TabletModeSwitch *tablet_switch,
++						    gboolean          tablet_mode);
++void              tablet_mode_switch_free          (TabletModeSwitch *tablet_switch);
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (TabletModeSwitch, tablet_mode_switch_free)
+diff --git a/src/test-hinge.c b/src/test-hinge.c
+new file mode 100644
+index 0000000..3bc223b
+--- /dev/null
++++ b/src/test-hinge.c
+@@ -0,0 +1,177 @@
++/*
++ * Copyright (c) 2026 Régis LELOUP <neonunux@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 3 as published by
++ * the Free Software Foundation.
++ */
++
++#include <glib.h>
++#include <locale.h>
++#include "hinge.h"
++
++static HingeMode
++feed (HingeState    *state,
++      const gdouble *angles,
++      gsize          n_angles,
++      LidState       lid)
++{
++	gsize i;
++
++	for (i = 0; i < n_angles; i++)
++		hinge_state_update (state, angles[i], lid);
++	return state->mode;
++}
++
++static void
++test_hinge_startup (void)
++{
++	static const struct {
++		gdouble   angle;
++		LidState  lid;
++		HingeMode expected;
++	} tests[] = {
++		{ 110.0, LID_STATE_UNKNOWN, HINGE_MODE_LAPTOP },
++		{ 300.0, LID_STATE_UNKNOWN, HINGE_MODE_TABLET },
++		{ 185.0, LID_STATE_UNKNOWN, HINGE_MODE_LAPTOP },	/* laptop opened flat */
++		{   5.0, LID_STATE_OPEN,    HINGE_MODE_TABLET },	/* folded flat */
++		{   5.0, LID_STATE_CLOSED,  HINGE_MODE_LAPTOP },	/* closed lid */
++		{   5.0, LID_STATE_UNKNOWN, HINGE_MODE_UNDEFINED },
++	};
++	guint i;
++
++	for (i = 0; i < G_N_ELEMENTS (tests); i++) {
++		HingeState state;
++
++		hinge_state_init (&state);
++		hinge_state_update (&state, tests[i].angle, tests[i].lid);
++		g_assert_cmpint (state.mode, ==, tests[i].expected);
++	}
++}
++
++static void
++test_hinge_debounce (void)
++{
++	HingeState state;
++
++	hinge_state_init (&state);
++	g_assert_true (hinge_state_update (&state, 110.0, LID_STATE_UNKNOWN));
++
++	/* A single reading is not enough to change modes */
++	g_assert_false (hinge_state_update (&state, 250.0, LID_STATE_UNKNOWN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_LAPTOP);
++	g_assert_false (hinge_state_update (&state, 110.0, LID_STATE_UNKNOWN));
++	g_assert_false (hinge_state_update (&state, 250.0, LID_STATE_UNKNOWN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_LAPTOP);
++
++	/* Two in a row are */
++	g_assert_true (hinge_state_update (&state, 260.0, LID_STATE_UNKNOWN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_TABLET);
++}
++
++static void
++test_hinge_hysteresis (void)
++{
++	static const gdouble to_tablet[] = { 300.0, 300.0 };
++	static const gdouble dead_band[] = { 185.0, 185.0, 175.0, 199.0 };
++	static const gdouble to_laptop[] = { 160.0, 160.0 };
++	HingeState state;
++
++	hinge_state_init (&state);
++	g_assert_cmpint (feed (&state, to_tablet, G_N_ELEMENTS (to_tablet), LID_STATE_UNKNOWN), ==, HINGE_MODE_TABLET);
++	g_assert_cmpint (feed (&state, dead_band, G_N_ELEMENTS (dead_band), LID_STATE_UNKNOWN), ==, HINGE_MODE_TABLET);
++	g_assert_cmpint (feed (&state, to_laptop, G_N_ELEMENTS (to_laptop), LID_STATE_UNKNOWN), ==, HINGE_MODE_LAPTOP);
++	g_assert_cmpint (feed (&state, dead_band, G_N_ELEMENTS (dead_band), LID_STATE_UNKNOWN), ==, HINGE_MODE_LAPTOP);
++}
++
++static void
++test_hinge_folded (void)
++{
++	static const gdouble fold[] = { 300.0, 350.0, 2.0, 0.0, 5.0, 0.0 };
++	static const gdouble open_lid[] = { 3.0, 10.0, 25.0, 20.0 };
++	HingeState state;
++
++	/* Folded flat: the angle wraps around to 0, stay in tablet mode,
++	 * whatever the lid switch says once started */
++	hinge_state_init (&state);
++	g_assert_cmpint (feed (&state, fold, G_N_ELEMENTS (fold), LID_STATE_UNKNOWN), ==, HINGE_MODE_TABLET);
++	g_assert_cmpint (feed (&state, fold + 2, 4, LID_STATE_CLOSED), ==, HINGE_MODE_TABLET);
++
++	/* Opening a closed lid goes through small angles with the lid
++	 * switch already open: stay in laptop mode */
++	hinge_state_init (&state);
++	g_assert_true (hinge_state_update (&state, 1.0, LID_STATE_CLOSED));
++	g_assert_cmpint (feed (&state, open_lid, G_N_ELEMENTS (open_lid), LID_STATE_OPEN), ==, HINGE_MODE_LAPTOP);
++}
++
++static void
++test_hinge_fast_fold (void)
++{
++	static const gdouble slow_close[] = { 110.0, 60.0, 20.0, 0.0 };
++	HingeState state;
++
++	/* Folded so fast that a single reading was seen in the tablet range */
++	hinge_state_init (&state);
++	g_assert_true (hinge_state_update (&state, 119.0, LID_STATE_UNKNOWN));
++	g_assert_false (hinge_state_update (&state, 280.0, LID_STATE_UNKNOWN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_LAPTOP);
++	g_assert_true (hinge_state_update (&state, 0.0, LID_STATE_UNKNOWN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_TABLET);
++	g_assert_false (hinge_state_update (&state, 3.0, LID_STATE_UNKNOWN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_TABLET);
++
++	/* Closing the lid, slowly or not, stays in laptop mode */
++	hinge_state_init (&state);
++	g_assert_cmpint (feed (&state, slow_close, G_N_ELEMENTS (slow_close), LID_STATE_OPEN), ==, HINGE_MODE_LAPTOP);
++	hinge_state_init (&state);
++	g_assert_true (hinge_state_update (&state, 110.0, LID_STATE_UNKNOWN));
++	g_assert_false (hinge_state_update (&state, 0.0, LID_STATE_OPEN));
++	g_assert_cmpint (state.mode, ==, HINGE_MODE_LAPTOP);
++}
++
++/* Hinge angles recorded on a Lenovo Yoga 910-13IKB, folded into a tablet
++ * and back, one reading every quarter of a second */
++static void
++test_hinge_recorded (void)
++{
++	static const gdouble angles[] = {
++		112, 133, 157, 198, 267, 303, 317, 328, 341, 2, 7, 0, 6, 0, 5,
++		0, 351, 319, 298, 263, 241, 207, 194, 89, 96, 89
++	};
++	static const HingeMode expected[] = {
++		HINGE_MODE_LAPTOP, HINGE_MODE_LAPTOP, HINGE_MODE_LAPTOP,
++		HINGE_MODE_LAPTOP, HINGE_MODE_LAPTOP, HINGE_MODE_TABLET,
++		HINGE_MODE_TABLET, HINGE_MODE_TABLET, HINGE_MODE_TABLET,
++		HINGE_MODE_TABLET, HINGE_MODE_TABLET, HINGE_MODE_TABLET,
++		HINGE_MODE_TABLET, HINGE_MODE_TABLET, HINGE_MODE_TABLET,
++		HINGE_MODE_TABLET, HINGE_MODE_TABLET, HINGE_MODE_TABLET,
++		HINGE_MODE_TABLET, HINGE_MODE_TABLET, HINGE_MODE_TABLET,
++		HINGE_MODE_TABLET, HINGE_MODE_TABLET, HINGE_MODE_TABLET,
++		HINGE_MODE_LAPTOP, HINGE_MODE_LAPTOP
++	};
++	HingeState state;
++	guint i;
++
++	G_STATIC_ASSERT (G_N_ELEMENTS (angles) == G_N_ELEMENTS (expected));
++
++	hinge_state_init (&state);
++	for (i = 0; i < G_N_ELEMENTS (angles); i++) {
++		hinge_state_update (&state, angles[i], LID_STATE_OPEN);
++		g_assert_cmpint (state.mode, ==, expected[i]);
++	}
++}
++
++int main (int argc, char **argv)
++{
++	setlocale (LC_ALL, "");
++	g_test_init (&argc, &argv, NULL);
++
++	g_test_add_func ("/iio-sensor-proxy/hinge/startup", test_hinge_startup);
++	g_test_add_func ("/iio-sensor-proxy/hinge/debounce", test_hinge_debounce);
++	g_test_add_func ("/iio-sensor-proxy/hinge/hysteresis", test_hinge_hysteresis);
++	g_test_add_func ("/iio-sensor-proxy/hinge/folded", test_hinge_folded);
++	g_test_add_func ("/iio-sensor-proxy/hinge/fast-fold", test_hinge_fast_fold);
++	g_test_add_func ("/iio-sensor-proxy/hinge/recorded", test_hinge_recorded);
++
++	return g_test_run ();
++}
+-- 
+2.53.0
+

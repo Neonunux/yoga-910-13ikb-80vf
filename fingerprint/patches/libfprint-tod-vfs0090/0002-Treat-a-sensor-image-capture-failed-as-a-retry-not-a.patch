@@ -1,0 +1,49 @@
+From c98fd390f74197aca125209782e91d67439151da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Sun, 27 Sep 2026 23:15:29 +0200
+Subject: [PATCH 2/2] Treat a sensor "image capture failed" as a retry, not a
+ hard error
+
+When the sensor sets the error flag on the image reply (finger moved, lifted
+too fast, partial contact), the download aborted the whole enroll/verify with
+FP_DEVICE_ERROR_DATA_INVALID. Report a retry and re-arm the scan instead, the
+same way the too-short and low-quality scan cases already do, so a single bad
+frame during enrollment no longer discards the whole session.
+
+Only the already-failing error path is touched; a successful capture is
+unaffected.
+---
+ vfs0090.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/vfs0090.c b/vfs0090.c
+index 7c123b0..9333157 100644
+--- a/vfs0090.c
++++ b/vfs0090.c
+@@ -162,6 +162,7 @@ print_hex (unsigned char *data, int len)
+ 
+ static void dev_deactivate (FpDevice *dev);
+ static void start_reactivate_ssm (FpDevice *dev);
++static void report_retry_error (FpDevice *dev, FpDeviceRetry retry);
+ static gboolean vfs0090_deinit (FpiDeviceVfs0090 *vdev,
+                                 GError          **error);
+ static void finger_scan_interrupt_callback (FpiUsbTransfer *transfer,
+@@ -2297,9 +2298,12 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
+ 
+       if (img_reply->image.error)
+         {
+-          fpi_ssm_mark_failed (ssm,
+-                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+-                                                         "Image capture failed"));
++          /* The sensor flagged the capture itself as failed (finger moved,
++           * lifted too fast, partial contact). Report a retry and re-arm the
++           * scan instead of aborting the whole action, mirroring the
++           * low-quality / too-short handling. */
++          report_retry_error (dev, FP_DEVICE_RETRY_GENERAL);
++          fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT);
+           return;
+         }
+ 
+-- 
+2.53.0
+

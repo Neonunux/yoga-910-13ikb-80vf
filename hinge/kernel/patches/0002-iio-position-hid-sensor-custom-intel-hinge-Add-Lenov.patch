@@ -1,0 +1,232 @@
+From 9978e61cf4552fed1071e3047ebd44dae0110fdf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Sat, 26 Sep 2026 22:21:46 +0200
+Subject: [PATCH 2/2] iio: position: hid-sensor-custom-intel-hinge: Add Lenovo
+ Yoga hinge
+
+The ITE sensor hub of some Lenovo Yoga convertibles, like the Yoga
+910-13IKB, exposes the same three angles as the Intel ISH hinge sensor
+in a different layout: custom values 1 to 3 hold the keyboard
+accelerometer, and custom values 4 to 6 the keyboard, screen and hinge
+angles, in tenths of a degree. No unit is declared, and the change
+sensitivity applies to all the custom values.
+
+Describe the layout of each sensor in the platform device id driver
+data, and add the Lenovo one for the HID-SENSOR-LENOVO-020b device
+registered by hid-sensor-custom.
+
+The capture callback read 32 bits for each field whatever its size,
+picking up the following bytes of the report for the 16 bits fields of
+the Lenovo sensor. Read the fields according to their size instead,
+sign extending them as the channels are signed.
+
+The existing conversion to radians of hinge angles without a declared
+unit applies as is, and the device name, channels and labels are
+unchanged, so userspace supporting the Intel hinge sensor works
+unmodified.
+
+Assisted-by: LLM
+---
+ drivers/iio/position/Kconfig                  |  5 +-
+ .../position/hid-sensor-custom-intel-hinge.c  | 95 ++++++++++++++-----
+ 2 files changed, 74 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/iio/position/Kconfig b/drivers/iio/position/Kconfig
+index 1576a63..7cc902a 100644
+--- a/drivers/iio/position/Kconfig
++++ b/drivers/iio/position/Kconfig
+@@ -26,8 +26,9 @@ config HID_SENSOR_CUSTOM_INTEL_HINGE
+ 	help
+ 	  This sensor present three angles, hinge angel, screen angles
+ 	  and keyboard angle respect to horizon (ground).
+-	  Say yes here to build support for the HID custom
+-	  intel hinge sensor.
++	  Say yes here to build support for the HID custom hinge sensor
++	  of the Intel Integrated Sensor Hub, and of the ITE sensor hub
++	  found in some Lenovo Yoga convertibles.
+ 
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called hid-sensor-custom-hinge.
+diff --git a/drivers/iio/position/hid-sensor-custom-intel-hinge.c b/drivers/iio/position/hid-sensor-custom-intel-hinge.c
+index d275bc1..3202097 100644
+--- a/drivers/iio/position/hid-sensor-custom-intel-hinge.c
++++ b/drivers/iio/position/hid-sensor-custom-intel-hinge.c
+@@ -8,6 +8,7 @@
+ #include <linux/iio/iio.h>
+ #include <linux/platform_device.h>
+ #include <linux/module.h>
++#include <linux/unaligned.h>
+ 
+ #include "../common/hid-sensors/hid-sensor-trigger.h"
+ 
+@@ -20,10 +21,37 @@ enum hinge_channel {
+ 
+ #define CHANNEL_SCAN_INDEX_TIMESTAMP CHANNEL_SCAN_INDEX_MAX
+ 
+-static const u32 hinge_addresses[CHANNEL_SCAN_INDEX_MAX] = {
+-	HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1),
+-	HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(2),
+-	HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(3)
++/*
++ * Layout of a hinge sensor: the custom value holding each angle, indexed by
++ * channel, and the field its change sensitivity applies to.
++ */
++struct hinge_chip_info {
++	u32 addresses[CHANNEL_SCAN_INDEX_MAX];
++	u32 sensitivity_address;
++};
++
++/* Intel Integrated Sensor Hub */
++static const struct hinge_chip_info intel_hinge_chip_info = {
++	.addresses = {
++		HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1),
++		HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(2),
++		HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(3),
++	},
++	.sensitivity_address = HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1),
++};
++
++/*
++ * ITE sensor hub of Lenovo Yoga convertibles: custom values 1 to 3 hold the
++ * keyboard accelerometer, 4 to 6 the keyboard, screen and hinge angles in
++ * tenths of a degree. The change sensitivity applies to all custom values.
++ */
++static const struct hinge_chip_info lenovo_hinge_chip_info = {
++	.addresses = {
++		HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(6),
++		HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(5),
++		HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(4),
++	},
++	.sensitivity_address = HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE_BASE,
+ };
+ 
+ static const char *const hinge_labels[CHANNEL_SCAN_INDEX_MAX] = { "hinge",
+@@ -32,6 +60,7 @@ static const char *const hinge_labels[CHANNEL_SCAN_INDEX_MAX] = { "hinge",
+ 
+ struct hinge_state {
+ 	struct iio_dev *indio_dev;
++	const struct hinge_chip_info *chip_info;
+ 	struct hid_sensor_hub_attribute_info hinge[CHANNEL_SCAN_INDEX_MAX];
+ 	struct hid_sensor_hub_callbacks callbacks;
+ 	struct hid_sensor_common common_attributes;
+@@ -48,10 +77,6 @@ struct hinge_state {
+ 	u64 timestamp;
+ };
+ 
+-static const u32 hinge_sensitivity_addresses[] = {
+-	HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1),
+-};
+-
+ /* Channel definitions */
+ static const struct iio_chan_spec hinge_channels[] = {
+ 	{
+@@ -110,6 +135,7 @@ static int hinge_read_raw(struct iio_dev *indio_dev,
+ 			  int *val, int *val2, long mask)
+ {
+ 	struct hinge_state *st = iio_priv(indio_dev);
++	const u32 *addresses = st->chip_info->addresses;
+ 	struct hid_sensor_hub_device *hsdev;
+ 	int report_id;
+ 	s32 min;
+@@ -127,7 +153,7 @@ static int hinge_read_raw(struct iio_dev *indio_dev,
+ 
+ 		*val = sensor_hub_input_attr_get_raw_value(st->common_attributes.hsdev,
+ 							   hsdev->usage,
+-							   hinge_addresses[chan->scan_index],
++							   addresses[chan->scan_index],
+ 							   report_id,
+ 							   SENSOR_HUB_SYNC, min < 0);
+ 
+@@ -214,22 +240,35 @@ static int hinge_capture_sample(struct hid_sensor_hub_device *hsdev,
+ {
+ 	struct iio_dev *indio_dev = platform_get_drvdata(priv);
+ 	struct hinge_state *st = iio_priv(indio_dev);
+-	int offset;
+-
+-	switch (usage_id) {
+-	case HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1):
+-	case HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(2):
+-	case HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(3):
+-		offset = usage_id - HID_USAGE_SENSOR_DATA_FIELD_CUSTOM_VALUE(1);
+-		st->scan.hinge_val[offset] = *(u32 *)raw_data;
+-		return 0;
+-	case HID_USAGE_SENSOR_TIME_TIMESTAMP:
++	int i;
++
++	if (usage_id == HID_USAGE_SENSOR_TIME_TIMESTAMP) {
+ 		st->timestamp = hid_sensor_convert_timestamp(&st->common_attributes,
+ 							     *(int64_t *)raw_data);
+ 		return 0;
+-	default:
+-		return -EINVAL;
+ 	}
++
++	for (i = 0; i < CHANNEL_SCAN_INDEX_MAX; i++) {
++		if (usage_id != st->chip_info->addresses[i])
++			continue;
++
++		/* The channels are signed, sign extend narrower fields */
++		switch (raw_len) {
++		case 1:
++			st->scan.hinge_val[i] = *(s8 *)raw_data;
++			return 0;
++		case 2:
++			st->scan.hinge_val[i] = (s16)get_unaligned_le16(raw_data);
++			return 0;
++		case 4:
++			st->scan.hinge_val[i] = get_unaligned_le32(raw_data);
++			return 0;
++		default:
++			return -EINVAL;
++		}
++	}
++
++	return -EINVAL;
+ }
+ 
+ /* Parse report which is specific to an usage id */
+@@ -245,7 +284,7 @@ static int hinge_parse_report(struct platform_device *pdev,
+ 		ret = sensor_hub_input_get_attribute_info(hsdev,
+ 							  HID_INPUT_REPORT,
+ 							  usage_id,
+-							  hinge_addresses[i],
++							  st->chip_info->addresses[i],
+ 							  &st->hinge[i]);
+ 		if (ret < 0)
+ 			return ret;
+@@ -276,6 +315,8 @@ static int hid_hinge_probe(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, indio_dev);
+ 
+ 	st = iio_priv(indio_dev);
++	st->chip_info = (const struct hinge_chip_info *)
++			platform_get_device_id(pdev)->driver_data;
+ 	st->common_attributes.hsdev = hsdev;
+ 	st->common_attributes.pdev = pdev;
+ 	st->indio_dev = indio_dev;
+@@ -284,8 +325,8 @@ static int hid_hinge_probe(struct platform_device *pdev)
+ 
+ 	ret = hid_sensor_parse_common_attributes(hsdev, hsdev->usage,
+ 						 &st->common_attributes,
+-						 hinge_sensitivity_addresses,
+-						 ARRAY_SIZE(hinge_sensitivity_addresses));
++						 &st->chip_info->sensitivity_address,
++						 1);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to setup common attributes\n");
+ 		return ret;
+@@ -357,6 +398,12 @@ static const struct platform_device_id hid_hinge_ids[] = {
+ 	{
+ 		/* Format: HID-SENSOR-INT-usage_id_in_hex_lowercase */
+ 		.name = "HID-SENSOR-INT-020b",
++		.driver_data = (kernel_ulong_t)&intel_hinge_chip_info,
++	},
++	{
++		/* Format: HID-SENSOR-LENOVO-usage_id_in_hex_lowercase */
++		.name = "HID-SENSOR-LENOVO-020b",
++		.driver_data = (kernel_ulong_t)&lenovo_hinge_chip_info,
+ 	},
+ 	{ }
+ };
+-- 
+2.53.0
+

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Yoga 910 tablet mode (hinge/setup.sh): after a resume, the kernel leaves
+# the HID sensors read through sysfs powered off; power them back on.
+# systemd-suspend.service ends right after the resume and kills whatever its
+# hooks left running, so the check runs in its own transient service.
+[ "$1" = post ] || exit 0
+systemd-run --no-block --collect --unit="yoga-sensor-hub-resume-$(date +%s)" \
+	--description="Yoga 910 sensor hub check after resume" \
+	/usr/local/libexec/yoga-sensor-hub-check --fix --after-resume >/dev/null 2>&1
+exit 0

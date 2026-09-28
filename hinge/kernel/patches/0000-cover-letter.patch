@@ -1,0 +1,65 @@
+From 9978e61cf4552fed1071e3047ebd44dae0110fdf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9gis=20LELOUP?= <neonunux@gmail.com>
+Date: Sat, 26 Sep 2026 22:21:46 +0200
+Subject: [PATCH 0/2] HID/iio: Support the hinge sensor of Lenovo Yoga convertibles
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The ITE sensor hub (ITE8186, I2C HID) of the Lenovo Yoga 910-13IKB
+exposes a custom sensor with the hinge, screen and keyboard angles. It is
+the only tablet mode related signal of this convertible I could find
+visible to the OS: the ACPI paths used by intel-vbtn, intel-hid and
+soc_button_array are disabled by its firmware, and it lacks the WMI
+interface of lenovo-ymc.
+
+This sensor carries the same angles as the Intel ISH hinge sensor, so
+this series routes it to the existing hid-sensor-custom-intel-hinge
+driver, which learns a second layout:
+
+ - patch 1 lets hid-sensor-custom recognise known custom sensors without
+   a LUID, as this one only has a model property, and describes it as
+   HID-SENSOR-LENOVO-020b;
+ - patch 2 teaches the hinge driver the Lenovo layout.
+
+Userspace sees the same "hinge" IIO device as on Intel machines: hinged,
+an existing tablet mode daemon supporting the Intel hinge sensor, drives
+it unmodified.
+
+Other Lenovo Yoga models may use the same hub firmware, but I could only
+test the 910-13IKB.
+
+Testing, on a Yoga 910-13IKB (80VF, BIOS 2JCN39WW), with both modules
+built out of tree against a 7.0 distribution kernel:
+
+ - HID-SENSOR-LENOVO-020b is created and bound, and the "hinge" IIO
+   device exposes the three labelled channels, with a scale of
+   0.001745329 (a tenth of a degree) and a 10 Hz sampling frequency;
+ - raw sysfs reads and the buffer both follow a full fold, from laptop
+   to tablet and back, in agreement with the angle derived from the
+   screen accelerometer, including while the base rests still;
+ - through the generic hid-sensor-custom driver, the angles read back
+   used to go stale while the base did not move. They no longer do once
+   the IIO driver powers the sensor on through the usual power and
+   reporting state sequence;
+ - the Intel ISH path is untested, for lack of hardware. Its layout is
+   unchanged, and its only functional change is how the capture callback
+   reads fields narrower than 32 bits.
+
+This series was checked with the help of an LLM coding assistant
+(Claude, by Anthropic). It analysed the report descriptor and the driver
+code, and ran the builds, checkpatch
+and the hardware tests above on my machine, under my direction.
+
+Régis LELOUP (2):
+  HID: hid-sensor-custom: Match known custom sensors without a LUID
+  iio: position: hid-sensor-custom-intel-hinge: Add Lenovo Yoga hinge
+
+ drivers/hid/hid-sensor-custom.c               | 57 ++++++-----
+ drivers/iio/position/Kconfig                  |  5 +-
+ .../position/hid-sensor-custom-intel-hinge.c  | 95 ++++++++++++++-----
+ 3 files changed, 109 insertions(+), 48 deletions(-)
+
+base-commit: fd179f8a05be3ccae366b9b96e176b51fbe54aab
+-- 
+2.53.0
