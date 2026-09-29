@@ -19,3 +19,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+------------------------------------------------------------------------------
+
+Exceptions
+
+The MIT license above covers the scripts, tools and documentation written for
+this repository. The files below are patches to, or modified copies of, files
+from other projects. They are distributed under the license of the project
+they come from, and the modified copies keep their original copyright
+notices:
+
+  GPL-2.0-only       hinge/kernel/patches/ and hinge/kernel/src/ (Linux)
+  GPL-3.0-or-later   hinge/iio-sensor-proxy/
+  MIT                fingerprint/patches/python-validity/
+  LGPL-2.1-or-later  fingerprint/patches/libfprint-tod-vfs0090/
+
+The full texts of the GPL and LGPL licenses are in the LICENSES/ directory.
